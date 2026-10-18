@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Virtual-Agent"
 readme = "README.md"
 keywords = ["agent", "profile", "cli", "awp"]
 categories = ["command-line-utilities"]
