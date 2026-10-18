@@ -1,0 +1,23 @@
+[package]
+name = "virtual-agent"
+description = "Virtual Agent — the user-facing profile-management facade over awp: where profiles live, how they are saved, edited, updated and shared. awp stays the runtime; this crate owns the custody layer."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["agent", "profile", "cli", "awp"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "virtual_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "va"
+path = "src/bin/va.rs"
+
+[dependencies]
+awp = { package = "agents-with-profiles", path = "../Agents-With-Profiles", version = "0.1.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
