@@ -113,10 +113,18 @@ impl Store {
         let Ok(current) = std::fs::read(&src) else {
             return Ok(None);
         };
+        self.record_snapshot(&current, op)
+    }
+
+    /// Record `superseded` — registry bytes about to be (or just)
+    /// replaced — as a snapshot + commit-log line. `save` calls it with
+    /// the pre-write document; `edit` calls it with the bytes captured
+    /// before the editor ran.
+    pub fn record_snapshot(&self, superseded: &[u8], op: &str) -> Result<Option<String>> {
         let dir = self.snapshots_dir();
         std::fs::create_dir_all(&dir).map_err(|e| Error::msg(e.to_string()))?;
         if let Some(latest) = self.snapshots()?.first() {
-            if std::fs::read(dir.join(&latest.name)).ok() == Some(current.clone()) {
+            if std::fs::read(dir.join(&latest.name)).ok().as_deref() == Some(superseded) {
                 return Ok(None);
             }
         }
@@ -125,12 +133,12 @@ impl Store {
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
         let name = format!("{ts_ms}.json");
-        std::fs::write(dir.join(&name), &current).map_err(|e| Error::msg(e.to_string()))?;
+        std::fs::write(dir.join(&name), superseded).map_err(|e| Error::msg(e.to_string()))?;
         let line = serde_json::json!({
             "name": name,
             "ts_ms": ts_ms,
             "op": op,
-            "hash": fnv1a_hex(&current),
+            "hash": fnv1a_hex(superseded),
         });
         use std::io::Write as _;
         let mut idx = std::fs::OpenOptions::new()
@@ -138,7 +146,7 @@ impl Store {
             .append(true)
             .open(self.index_path())
             .map_err(|e| Error::msg(e.to_string()))?;
-        let _ = writeln!(idx, "{line}");
+        writeln!(idx, "{line}").map_err(|e| Error::msg(e.to_string()))?;
         let all = self.snapshots()?;
         for old in all.iter().skip(Self::RETAIN) {
             let _ = std::fs::remove_file(dir.join(&old.name));

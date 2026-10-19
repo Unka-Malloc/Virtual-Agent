@@ -131,13 +131,15 @@ pub fn run(store: &Store) -> Result<()> {
         let pending = Arc::clone(&pending);
         std::thread::spawn(move || {
             let stdout = std::io::stdout();
-            let mut out = stdout.lock();
+            // Lock per write, not for the whole relay: the input thread
+            // must be able to answer a failed session/open while a live
+            // session's events are flowing through here.
             for line in BufReader::new(child_out).lines() {
                 let Ok(line) = line else { break };
                 let mut v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => {
-                        let _ = writeln!(out, "{line}");
+                        let _ = writeln!(stdout.lock(), "{line}");
                         continue;
                     }
                 };
@@ -153,6 +155,7 @@ pub fn run(store: &Store) -> Result<()> {
                         );
                     }
                 }
+                let mut out = stdout.lock();
                 let _ = writeln!(out, "{v}");
                 let _ = out.flush();
             }

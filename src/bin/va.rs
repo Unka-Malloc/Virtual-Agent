@@ -142,6 +142,7 @@ fn run() -> Result<()> {
         }
         Some("edit") => {
             let store = open_store()?;
+            let before = std::fs::read(store.registry_path()).ok();
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
             let status = std::process::Command::new(editor)
                 .arg(store.registry_path())
@@ -149,6 +150,13 @@ fn run() -> Result<()> {
                 .map_err(|e| Error(e.to_string()))?;
             if !status.success() {
                 return Err(Error("editor exited non-zero".into()));
+            }
+            // The editor bypassed save(); if bytes changed, archive the
+            // state it replaced so the custody chain stays complete.
+            if std::fs::read(store.registry_path()).ok() != before {
+                if let Some(old) = before {
+                    store.record_snapshot(&old, "edit")?;
+                }
             }
             // Saving is only acknowledged if the document still validates.
             let doc = store.load()?;
