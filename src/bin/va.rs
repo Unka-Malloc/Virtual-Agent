@@ -18,8 +18,9 @@ fn usage() -> ! {
   va edit                         open the registry in $EDITOR
   va export [<profile>] [--out FILE]   share: whole doc or one profile unit
   va import <file> [--force]      merge a registry document
-  va snapshots                    list captured registry versions
+  va snapshots                    list commits (op + content hash + version)
   va restore <snapshot>           roll back to a captured version
+  va revert                       undo the most recent change
   va run <profile|binding> [extra awp args...]
   va resolve <profile|binding> [extra awp args...]"
     );
@@ -115,7 +116,7 @@ fn run() -> Result<()> {
                 }
                 _ => usage(),
             }
-            store.save(&doc)?;
+            store.save(&doc, "set")?;
             println!("{kind} {id} saved");
         }
         Some("rm") => {
@@ -135,7 +136,7 @@ fn run() -> Result<()> {
             if !removed {
                 return Err(Error(format!("{kind} not found: {id}")));
             }
-            store.save(&doc)?;
+            store.save(&doc, "rm")?;
             println!("{kind} {id} removed");
         }
         Some("edit") => {
@@ -192,10 +193,16 @@ fn run() -> Result<()> {
             }
         }
         Some("snapshots") => {
-            for s in open_store()?.snapshots()? {
+            let store = open_store()?;
+            let commits = store.commits()?;
+            for s in store.snapshots()? {
+                let c = commits.iter().find(|c| c.name == s.name);
+                let (op, hash) = c
+                    .map(|c| (c.op.as_str(), c.hash.as_str()))
+                    .unwrap_or(("?", ""));
                 println!(
-                    "{}  agents={} profiles={} bindings={}",
-                    s.name, s.agents, s.profiles, s.bindings
+                    "{}  {:<8} {}  agents={} profiles={} bindings={}",
+                    s.name, op, hash, s.agents, s.profiles, s.bindings
                 );
             }
         }
@@ -205,6 +212,10 @@ fn run() -> Result<()> {
                 .ok_or_else(|| Error("missing snapshot name".into()))?;
             open_store()?.restore(name)?;
             println!("restored {name}");
+        }
+        Some("revert") => {
+            open_store()?.revert()?;
+            println!("reverted to previous snapshot");
         }
         Some(cmd @ ("run" | "resolve")) => {
             let name = args.get(1).ok_or_else(|| Error("missing name".into()))?;

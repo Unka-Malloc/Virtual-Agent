@@ -52,7 +52,7 @@ impl Store {
         let store = Self { root: root.into() };
         std::fs::create_dir_all(&store.root).map_err(|e| Error::msg(e.to_string()))?;
         if !store.registry_path().exists() {
-            store.save(&RegistryDocument::default())?;
+            store.save(&RegistryDocument::default(), "init")?;
         }
         Ok(store)
     }
@@ -73,17 +73,18 @@ impl Store {
             .map_err(|e| Error::msg(format!("registry document corrupt: {e}")))
     }
 
-    /// Validate then atomically persist. A document that fails awp's
-    /// registry validation never reaches disk. The previous registry, when
-    /// one exists and differs, is kept as a snapshot first — every write is
+    /// Validate then atomically persist, recording the operation that
+    /// produced this commit. A document that fails awp's registry
+    /// validation never reaches disk. The previous registry, when one
+    /// exists and differs, is kept as a snapshot first — every write is
     /// recoverable.
-    pub fn save(&self, doc: &RegistryDocument) -> Result<()> {
+    pub fn save(&self, doc: &RegistryDocument, op: &str) -> Result<()> {
         Registry::from_document(doc.clone())
             .map_err(|e| Error::msg(format!("invalid registry document: {e}")))?;
         let text = serde_json::to_string_pretty(doc).map_err(|e| Error::msg(e.to_string()))?;
         let path = self.registry_path();
         if path.exists() && std::fs::read(&path).ok().as_deref() != Some(text.as_bytes()) {
-            let _ = self.snapshot()?;
+            let _ = self.snapshot(op)?;
         }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| Error::msg(e.to_string()))?;
@@ -94,13 +95,18 @@ impl Store {
         self.root.join("snapshots")
     }
 
+    fn index_path(&self) -> PathBuf {
+        self.snapshots_dir().join("index.jsonl")
+    }
+
     /// Keep at most `RETAIN` newest snapshots.
     const RETAIN: usize = 50;
 
-    /// Copy the current registry into `snapshots/`. No-op when no registry
-    /// exists yet; skips when the newest snapshot already holds the same
-    /// bytes.
-    pub fn snapshot(&self) -> Result<Option<String>> {
+    /// Copy the current registry into `snapshots/` and record a commit
+    /// line (`op` + content hash) in `index.jsonl`. No-op when no
+    /// registry exists yet; skips when the newest snapshot already holds
+    /// the same bytes.
+    pub fn snapshot(&self, op: &str) -> Result<Option<String>> {
         let src = self.registry_path();
         let Ok(current) = std::fs::read(&src) else {
             return Ok(None);
@@ -112,19 +118,66 @@ impl Store {
                 return Ok(None);
             }
         }
-        let name = format!(
-            "{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default()
-        );
-        std::fs::write(dir.join(&name), current).map_err(|e| Error::msg(e.to_string()))?;
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let name = format!("{ts_ms}.json");
+        std::fs::write(dir.join(&name), &current).map_err(|e| Error::msg(e.to_string()))?;
+        let line = serde_json::json!({
+            "name": name,
+            "ts_ms": ts_ms,
+            "op": op,
+            "hash": fnv1a_hex(&current),
+        });
+        use std::io::Write as _;
+        let mut idx = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.index_path())
+            .map_err(|e| Error::msg(e.to_string()))?;
+        let _ = writeln!(idx, "{line}");
         let all = self.snapshots()?;
         for old in all.iter().skip(Self::RETAIN) {
             let _ = std::fs::remove_file(dir.join(&old.name));
         }
         Ok(Some(name))
+    }
+
+    /// The commit log: every recorded snapshot, newest first. Snapshots
+    /// that predate the index carry `op: "?"` and an empty hash.
+    pub fn commits(&self) -> Result<Vec<Commit>> {
+        let mut indexed: std::collections::BTreeMap<String, Commit> =
+            std::collections::BTreeMap::new();
+        if let Ok(text) = std::fs::read_to_string(self.index_path()) {
+            for line in text.lines() {
+                if let Ok(c) = serde_json::from_str::<Commit>(line) {
+                    indexed.insert(c.name.clone(), c);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for s in self.snapshots()? {
+            out.push(indexed.remove(&s.name).unwrap_or(Commit {
+                name: s.name,
+                ts_ms: 0,
+                op: "?".into(),
+                hash: String::new(),
+            }));
+        }
+        Ok(out)
+    }
+
+    /// Revert one step: restore the newest snapshot — the state before
+    /// the most recent change. The revert itself snapshots, so undo is
+    /// reversible.
+    pub fn revert(&self) -> Result<RegistryDocument> {
+        let latest = self
+            .snapshots()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::msg("nothing to revert"))?;
+        self.restore(&latest.name)
     }
 
     /// All snapshots, newest first.
@@ -167,7 +220,7 @@ impl Store {
         let text = std::fs::read_to_string(&path).map_err(|e| Error::msg(e.to_string()))?;
         let doc: RegistryDocument = serde_json::from_str(&text)
             .map_err(|e| Error::msg(format!("snapshot corrupt: {e}")))?;
-        self.save(&doc)?;
+        self.save(&doc, "restore")?;
         Ok(doc)
     }
 
@@ -186,7 +239,7 @@ impl Store {
         for (id, entry) in other.bindings {
             merge_one(&mut doc.bindings, id, entry, force, &mut report);
         }
-        self.save(&doc)?;
+        self.save(&doc, "merge")?;
         Ok(report)
     }
 
@@ -241,6 +294,25 @@ pub struct Snapshot {
     pub agents: usize,
     pub profiles: usize,
     pub bindings: usize,
+}
+
+/// One commit-log line: which operation produced the snapshot plus a
+/// content hash — the audit spine of Snapshot + Commit + Reverse.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Commit {
+    pub name: String,
+    pub ts_ms: u64,
+    pub op: String,
+    pub hash: String,
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2235;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Outcome of a merge: which ids were inserted, overwritten (force), or
@@ -358,8 +430,8 @@ mod snapshot_tests {
     #[test]
     fn save_snapshots_previous_version() {
         let (s, dir) = store("auto");
-        s.save(&doc_with("p1")).unwrap();
-        s.save(&doc_with("p2")).unwrap();
+        s.save(&doc_with("p1"), "set").unwrap();
+        s.save(&doc_with("p2"), "set").unwrap();
         // Two snapshots: the initial empty registry, then the p1 doc.
         let snaps = s.snapshots().unwrap();
         assert_eq!(snaps.len(), 2);
@@ -370,8 +442,8 @@ mod snapshot_tests {
     #[test]
     fn restore_brings_back_previous_doc() {
         let (s, dir) = store("restore");
-        s.save(&doc_with("p1")).unwrap();
-        s.save(&doc_with("p2")).unwrap();
+        s.save(&doc_with("p1"), "set").unwrap();
+        s.save(&doc_with("p2"), "set").unwrap();
         let name = s.snapshots().unwrap()[0].name.clone();
         s.restore(&name).unwrap();
         assert!(s.load().unwrap().profiles.contains_key("p1"));
@@ -383,11 +455,29 @@ mod snapshot_tests {
     #[test]
     fn duplicate_write_leaves_no_new_snapshot() {
         let (s, dir) = store("dedupe");
-        s.save(&doc_with("p1")).unwrap();
-        s.save(&doc_with("p1")).unwrap();
+        s.save(&doc_with("p1"), "set").unwrap();
+        s.save(&doc_with("p1"), "set").unwrap();
         // Only the initial empty doc was captured; the identical rewrite
         // added nothing.
         assert_eq!(s.snapshots().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commits_record_the_op_and_revert_undoes() {
+        let (s, dir) = store("commit");
+        s.save(&doc_with("p1"), "set").unwrap();
+        s.save(&doc_with("p2"), "rm").unwrap();
+        let commits = s.commits().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].op, "rm"); // newest first
+        assert_eq!(commits[1].op, "set");
+        assert_eq!(commits[0].hash.len(), 16);
+
+        s.revert().unwrap();
+        assert!(s.load().unwrap().profiles.contains_key("p1"));
+        // The revert snapshotted the pre-revert state — undo is reversible.
+        assert_eq!(s.snapshots().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 
