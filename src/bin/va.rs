@@ -18,6 +18,8 @@ fn usage() -> ! {
   va edit                         open the registry in $EDITOR
   va export [<profile>] [--out FILE]   share: whole doc or one profile unit
   va import <file> [--force]      merge a registry document
+  va snapshots                    list captured registry versions
+  va restore <snapshot>           roll back to a captured version
   va run <profile|binding> [extra awp args...]
   va resolve <profile|binding> [extra awp args...]"
     );
@@ -188,6 +190,21 @@ fn run() -> Result<()> {
             if !report.skipped.is_empty() {
                 println!("skipped existing ids: {}", report.skipped.join(", "));
             }
+        }
+        Some("snapshots") => {
+            for s in open_store()?.snapshots()? {
+                println!(
+                    "{}  agents={} profiles={} bindings={}",
+                    s.name, s.agents, s.profiles, s.bindings
+                );
+            }
+        }
+        Some("restore") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| Error("missing snapshot name".into()))?;
+            open_store()?.restore(name)?;
+            println!("restored {name}");
         }
         Some(cmd @ ("run" | "resolve")) => {
             let name = args.get(1).ok_or_else(|| Error("missing name".into()))?;

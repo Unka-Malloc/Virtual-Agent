@@ -74,15 +74,101 @@ impl Store {
     }
 
     /// Validate then atomically persist. A document that fails awp's
-    /// registry validation never reaches disk.
+    /// registry validation never reaches disk. The previous registry, when
+    /// one exists and differs, is kept as a snapshot first — every write is
+    /// recoverable.
     pub fn save(&self, doc: &RegistryDocument) -> Result<()> {
         Registry::from_document(doc.clone())
             .map_err(|e| Error::msg(format!("invalid registry document: {e}")))?;
         let text = serde_json::to_string_pretty(doc).map_err(|e| Error::msg(e.to_string()))?;
         let path = self.registry_path();
+        if path.exists() && std::fs::read(&path).ok().as_deref() != Some(text.as_bytes()) {
+            let _ = self.snapshot()?;
+        }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| Error::msg(e.to_string()))?;
         std::fs::rename(&tmp, &path).map_err(|e| Error::msg(e.to_string()))
+    }
+
+    fn snapshots_dir(&self) -> PathBuf {
+        self.root.join("snapshots")
+    }
+
+    /// Keep at most `RETAIN` newest snapshots.
+    const RETAIN: usize = 50;
+
+    /// Copy the current registry into `snapshots/`. No-op when no registry
+    /// exists yet; skips when the newest snapshot already holds the same
+    /// bytes.
+    pub fn snapshot(&self) -> Result<Option<String>> {
+        let src = self.registry_path();
+        let Ok(current) = std::fs::read(&src) else {
+            return Ok(None);
+        };
+        let dir = self.snapshots_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| Error::msg(e.to_string()))?;
+        if let Some(latest) = self.snapshots()?.first() {
+            if std::fs::read(dir.join(&latest.name)).ok() == Some(current.clone()) {
+                return Ok(None);
+            }
+        }
+        let name = format!(
+            "{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        );
+        std::fs::write(dir.join(&name), current).map_err(|e| Error::msg(e.to_string()))?;
+        let all = self.snapshots()?;
+        for old in all.iter().skip(Self::RETAIN) {
+            let _ = std::fs::remove_file(dir.join(&old.name));
+        }
+        Ok(Some(name))
+    }
+
+    /// All snapshots, newest first.
+    pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
+        let dir = self.snapshots_dir();
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(out);
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<RegistryDocument>(&text) else {
+                continue;
+            };
+            out.push(Snapshot {
+                name,
+                agents: doc.agents.len(),
+                profiles: doc.profiles.len(),
+                bindings: doc.bindings.len(),
+            });
+        }
+        out.sort_by(|a, b| b.name.cmp(&a.name));
+        Ok(out)
+    }
+
+    /// Restore a snapshot as the live registry. The snapshot is validated
+    /// through awp like any save, and restoring itself snapshots the
+    /// current state — a restore is itself reversible.
+    pub fn restore(&self, name: &str) -> Result<RegistryDocument> {
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(Error::msg("invalid snapshot name"));
+        }
+        let path = self.snapshots_dir().join(name);
+        let text = std::fs::read_to_string(&path).map_err(|e| Error::msg(e.to_string()))?;
+        let doc: RegistryDocument = serde_json::from_str(&text)
+            .map_err(|e| Error::msg(format!("snapshot corrupt: {e}")))?;
+        self.save(&doc)?;
+        Ok(doc)
     }
 
     /// Merge `other` into the stored document. Existing ids are kept
@@ -147,6 +233,14 @@ fn merge_one<T>(
         map.insert(id.clone(), value);
         report.inserted.push(id);
     }
+}
+
+/// One stored snapshot: filename and entry counts for listing.
+pub struct Snapshot {
+    pub name: String,
+    pub agents: usize,
+    pub profiles: usize,
+    pub bindings: usize,
 }
 
 /// Outcome of a merge: which ids were inserted, overwritten (force), or
@@ -237,6 +331,72 @@ mod tests {
         let (store, dir) = store("corrupt");
         std::fs::write(store.registry_path(), "{not json").unwrap();
         assert!(store.load().is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn store(tag: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("va-snap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::open(&dir).unwrap(), dir)
+    }
+
+    fn doc_with(id: &str) -> RegistryDocument {
+        serde_json::from_value(serde_json::json!({
+            "agents": { "a": { "id": "a", "lane": "cli",
+                "command": { "program": "echo", "args": [],
+                    "env": { "sanitized": { "inherit": [], "set": {} } } } } },
+            "profiles": { id: { "agent": "a" } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn save_snapshots_previous_version() {
+        let (s, dir) = store("auto");
+        s.save(&doc_with("p1")).unwrap();
+        s.save(&doc_with("p2")).unwrap();
+        // Two snapshots: the initial empty registry, then the p1 doc.
+        let snaps = s.snapshots().unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].profiles, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_brings_back_previous_doc() {
+        let (s, dir) = store("restore");
+        s.save(&doc_with("p1")).unwrap();
+        s.save(&doc_with("p2")).unwrap();
+        let name = s.snapshots().unwrap()[0].name.clone();
+        s.restore(&name).unwrap();
+        assert!(s.load().unwrap().profiles.contains_key("p1"));
+        // empty + p1 + the p2 state the restore snapshotted — reversible.
+        assert_eq!(s.snapshots().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_write_leaves_no_new_snapshot() {
+        let (s, dir) = store("dedupe");
+        s.save(&doc_with("p1")).unwrap();
+        s.save(&doc_with("p1")).unwrap();
+        // Only the initial empty doc was captured; the identical rewrite
+        // added nothing.
+        assert_eq!(s.snapshots().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_rejects_bad_names() {
+        let (s, dir) = store("names");
+        for n in ["../x", "a/b", ".."] {
+            assert!(s.restore(n).is_err());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
