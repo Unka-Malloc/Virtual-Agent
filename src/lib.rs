@@ -177,7 +177,7 @@ impl Store {
             .into_iter()
             .next()
             .ok_or_else(|| Error::msg("nothing to revert"))?;
-        self.restore(&latest.name)
+        self.restore_op(&latest.name, "revert")
     }
 
     /// All snapshots, newest first.
@@ -213,6 +213,10 @@ impl Store {
     /// through awp like any save, and restoring itself snapshots the
     /// current state — a restore is itself reversible.
     pub fn restore(&self, name: &str) -> Result<RegistryDocument> {
+        self.restore_op(name, "restore")
+    }
+
+    fn restore_op(&self, name: &str, op: &str) -> Result<RegistryDocument> {
         if name.contains('/') || name.contains('\\') || name.contains("..") {
             return Err(Error::msg("invalid snapshot name"));
         }
@@ -220,7 +224,7 @@ impl Store {
         let text = std::fs::read_to_string(&path).map_err(|e| Error::msg(e.to_string()))?;
         let doc: RegistryDocument = serde_json::from_str(&text)
             .map_err(|e| Error::msg(format!("snapshot corrupt: {e}")))?;
-        self.save(&doc, "restore")?;
+        self.save(&doc, op)?;
         Ok(doc)
     }
 
