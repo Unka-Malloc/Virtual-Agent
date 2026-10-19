@@ -1,10 +1,11 @@
 # virtual-agent — `va`
 
 The user-facing profile-management facade over
-[`awp`](https://crates.io/crates/awp). awp is a runtime: hand it a
-`RegistryDocument` and it materializes a `VirtualAgent` — it deliberately
-does not care where that document lives, how profiles are saved, edited,
-restored, updated or shared. **`va` owns that custody layer.**
+[`agents-with-profiles`](https://crates.io/crates/agents-with-profiles)
+(`awp`). awp is a runtime: hand it a `RegistryDocument` and it
+materializes a `VirtualAgent` — it deliberately does not care where that
+document lives, how profiles are saved, edited, restored, updated or
+shared. **`va` owns that custody layer.**
 
 ```
 ~/.virtual-agent/registry.json   the canonical registry document
@@ -30,9 +31,15 @@ Design premise: same as the sibling projects in
 | `va export [<profile>] [--out f]` | whole doc, or one profile + its agent + bindings |
 | `va import <file> [--force]` | merge a registry document; collisions skip or overwrite |
 | `va run <name>` / `va resolve <name>` | delegate to `awp` with the managed registry |
+| `va snapshots` | list registry snapshots with their op and content hash |
+| `va revert` | roll back the most recent mutation |
+| `va serve` | `a4aa.v1`-compatible session facade: `session/open` names a binding, `va` resolves it to a spec, pins a custody record (selector, spec hash, registry hash) onto the session and relays prompts, events, permissions and cancellation to the managed `a4aa serve` child |
 
 Every mutation validates through `awp::Registry::from_document` before it
 reaches disk — the store never holds a document the runtime would reject.
+Every mutation is also snapshotted beforehand (a `snapshots/` ring plus an
+`index.jsonl` op log), so `va revert` and `va restore` can walk the
+registry backwards.
 
 ## Verify
 
