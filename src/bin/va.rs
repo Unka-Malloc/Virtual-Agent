@@ -22,7 +22,8 @@ fn usage() -> ! {
   va restore <snapshot>           roll back to a captured version
   va revert                       undo the most recent change
   va run <profile|binding> [extra awp args...]
-  va resolve <profile|binding> [extra awp args...]"
+  va resolve <profile|binding> [extra awp args...]
+  va serve                        a4aa.v1-compatible session facade over the registry"
     );
     std::process::exit(2)
 }
@@ -216,6 +217,10 @@ fn run() -> Result<()> {
         Some("revert") => {
             open_store()?.revert()?;
             println!("reverted to previous snapshot");
+        }
+        Some("serve") => {
+            let store = open_store()?;
+            virtual_agent::serve::run(&store)?;
         }
         Some(cmd @ ("run" | "resolve")) => {
             let name = args.get(1).ok_or_else(|| Error("missing name".into()))?;

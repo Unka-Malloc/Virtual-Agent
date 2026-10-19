@@ -6,6 +6,8 @@
 //! `~/.virtual-agent/registry.json`, validated mutation, import/export
 //! for sharing, and delegation to the `awp` binary for execution.
 
+pub mod serve;
+
 use awp::{Registry, RegistryDocument};
 use std::path::{Path, PathBuf};
 
@@ -310,7 +312,7 @@ pub struct Commit {
     pub hash: String,
 }
 
-fn fnv1a_hex(bytes: &[u8]) -> String {
+pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2235;
     for &b in bytes {
         h ^= u64::from(b);
